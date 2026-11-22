@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import suppress
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -15,6 +16,7 @@ Color = tuple[int, int, int]
 class DashboardCommand(StrEnum):
     CONTINUE = "continue"
     RESTART = "restart"
+    TOGGLE_MUTE = "toggle_mute"
     QUIT = "quit"
 
 
@@ -28,6 +30,7 @@ class DashboardTheme:
     muted: Color = (141, 150, 163)
     accent: Color = (137, 166, 193)
     accent_soft: Color = (72, 89, 105)
+    success: Color = (108, 191, 132)
     warning: Color = (210, 167, 100)
     danger: Color = (199, 112, 101)
 
@@ -44,6 +47,68 @@ def clamp01(value: float | None) -> float:
     if value is None:
         return 0.0
     return max(0.0, min(1.0, float(value)))
+
+
+def _dashboard_status(
+    theme: DashboardTheme,
+    *,
+    snapshot: MarioSnapshot,
+    waiting: bool,
+    run_ended: bool,
+    finishing: bool = False,
+) -> tuple[str, Color]:
+    if snapshot.clear and finishing:
+        return ("Stage clear — finishing", theme.success)
+    if run_ended and snapshot.clear:
+        return ("Stage clear!", theme.success)
+    if run_ended and snapshot.dead:
+        return ("Mario died", theme.danger)
+    if run_ended:
+        return ("Run ended", theme.danger)
+    if waiting:
+        return ("Waiting for Jev", theme.warning)
+    return ("Live decision loop", theme.accent)
+
+
+UI_FONT_CANDIDATES: tuple[str, ...] = (
+    "Segoe UI",
+    "Inter",
+    "Noto Sans",
+    "DejaVu Sans",
+    "Liberation Sans",
+    "Arial",
+)
+UI_SEMIBOLD_FONT_CANDIDATES: tuple[str, ...] = (
+    "Segoe UI Semibold",
+    "Inter",
+    "Noto Sans",
+    "DejaVu Sans",
+    "Liberation Sans",
+    "Arial",
+)
+MONO_FONT_CANDIDATES: tuple[str, ...] = (
+    "Cascadia Mono",
+    "JetBrains Mono",
+    "Noto Mono",
+    "DejaVu Sans Mono",
+    "Liberation Mono",
+    "Consolas",
+    "Menlo",
+)
+
+
+def _load_font(
+    pg: Any,
+    candidates: tuple[str, ...],
+    size: int,
+    *,
+    bold: bool = False,
+) -> Any:
+    for name in candidates:
+        matched = pg.font.match_font(name, bold=bold)
+        if matched:
+            return pg.font.Font(matched, size)
+    return pg.font.Font(None, size)
 
 
 class LiveDashboard:
@@ -64,16 +129,18 @@ class LiveDashboard:
         self.pg = pygame
         self.config = config or DashboardConfig()
         self.theme = theme or DashboardTheme()
+        with suppress(pygame.error, RuntimeError, OSError):
+            pygame.mixer.pre_init(frequency=44_100, size=-16, channels=2, buffer=512)
         pygame.init()
         pygame.display.set_caption("TypeSafe plays Super Mario Bros.")
         self.screen = pygame.display.set_mode((self.config.width, self.config.height))
         self.clock = pygame.time.Clock()
-        self.font_title = pygame.font.SysFont("Segoe UI Semibold", 25)
-        self.font_action = pygame.font.SysFont("Segoe UI Semibold", 31)
-        self.font_body = pygame.font.SysFont("Segoe UI", 17)
-        self.font_small = pygame.font.SysFont("Segoe UI", 14)
-        self.font_label = pygame.font.SysFont("Segoe UI Semibold", 14)
-        self.font_mono = pygame.font.SysFont("Cascadia Mono", 14)
+        self.font_title = _load_font(pygame, UI_SEMIBOLD_FONT_CANDIDATES, 25, bold=True)
+        self.font_action = _load_font(pygame, UI_SEMIBOLD_FONT_CANDIDATES, 31, bold=True)
+        self.font_body = _load_font(pygame, UI_FONT_CANDIDATES, 17)
+        self.font_small = _load_font(pygame, UI_FONT_CANDIDATES, 14)
+        self.font_label = _load_font(pygame, UI_SEMIBOLD_FONT_CANDIDATES, 14, bold=True)
+        self.font_mono = _load_font(pygame, MONO_FONT_CANDIDATES, 14)
 
     def close(self) -> None:
         self.pg.quit()
@@ -149,8 +216,70 @@ class LiveDashboard:
         self.screen.blit(scaled, (target_x, target_y))
         self.pg.draw.rect(self.screen, self.theme.line, (x, y, width, height), 1, border_radius=4)
 
+    def _draw_clear_banner(
+        self,
+        snapshot: MarioSnapshot,
+        episode_reward: float,
+        x: int,
+        y: int,
+        width: int,
+        height: int,
+    ) -> None:
+        t = self.theme
+        banner_w = min(460, width - 48)
+        banner_h = 132
+        banner_x = x + (width - banner_w) // 2
+        banner_y = y + (height - banner_h) // 2
+
+        overlay = self.pg.Surface((banner_w, banner_h), self.pg.SRCALPHA)
+        overlay.fill((*t.surface, 224))
+        self.screen.blit(overlay, (banner_x, banner_y))
+        self.pg.draw.rect(
+            self.screen,
+            t.success,
+            (banner_x, banner_y, banner_w, banner_h),
+            2,
+            border_radius=8,
+        )
+
+        title = "STAGE CLEAR!"
+        title_w, _ = self.font_action.size(title)
+        self._text(
+            title,
+            self.font_action,
+            t.success,
+            banner_x + (banner_w - title_w) // 2,
+            banner_y + 18,
+        )
+
+        detail = (
+            f"World {snapshot.world}-{snapshot.stage} finished  ·  "
+            f"Score {snapshot.score:,}  ·  Reward {episode_reward:+.1f}"
+        )
+        detail_w, _ = self.font_body.size(detail)
+        self._text(
+            detail,
+            self.font_body,
+            t.text,
+            banner_x + (banner_w - detail_w) // 2,
+            banner_y + 62,
+        )
+
+        hint = "Press R to restart  ·  Esc or Q to quit"
+        hint_w, _ = self.font_small.size(hint)
+        self._text(
+            hint,
+            self.font_small,
+            t.muted,
+            banner_x + (banner_w - hint_w) // 2,
+            banner_y + 94,
+        )
+
     def _restart_rect(self) -> Any:
         return self.pg.Rect(self.config.width - 144, 13, 120, 36)
+
+    def _mute_rect(self) -> Any:
+        return self.pg.Rect(self.config.width - 264, 13, 108, 36)
 
     def draw(
         self,
@@ -162,8 +291,11 @@ class LiveDashboard:
         episode_reward: float,
         waiting: bool = False,
         run_ended: bool = False,
+        finishing: bool = False,
+        sound_enabled: bool | None = None,
     ) -> DashboardCommand:
         restart_rect = self._restart_rect()
+        mute_rect = self._mute_rect()
         command = DashboardCommand.CONTINUE
         for event in self.pg.event.get():
             if event.type == self.pg.QUIT:
@@ -173,11 +305,16 @@ class LiveDashboard:
             if event.type == self.pg.KEYDOWN and event.key == self.pg.K_r:
                 command = DashboardCommand.RESTART
             if (
-                event.type == self.pg.MOUSEBUTTONDOWN
-                and event.button == 1
-                and restart_rect.collidepoint(event.pos)
+                sound_enabled is not None
+                and event.type == self.pg.KEYDOWN
+                and event.key == self.pg.K_m
             ):
-                command = DashboardCommand.RESTART
+                command = DashboardCommand.TOGGLE_MUTE
+            if event.type == self.pg.MOUSEBUTTONDOWN and event.button == 1:
+                if restart_rect.collidepoint(event.pos):
+                    command = DashboardCommand.RESTART
+                elif sound_enabled is not None and mute_rect.collidepoint(event.pos):
+                    command = DashboardCommand.TOGGLE_MUTE
 
         c = self.config
         t = self.theme
@@ -191,16 +328,35 @@ class LiveDashboard:
         game_h = c.height - game_y - margin
 
         self._text("TypeSafe plays Mario", self.font_title, t.text, margin, 18)
-        if run_ended:
-            status = "Run ended"
-        else:
-            status = "Waiting for Jev" if waiting else "Live decision loop"
+        status, status_color = _dashboard_status(
+            t,
+            snapshot=snapshot,
+            waiting=waiting,
+            run_ended=run_ended,
+            finishing=finishing,
+        )
         status_width = self.font_small.size(status)[0]
         dot_x = panel_x - status_width - 24
-        status_color = t.danger if run_ended else (t.warning if waiting else t.accent)
         self.pg.draw.circle(self.screen, status_color, (dot_x, 31), 4)
         self._text(status, self.font_small, t.muted, dot_x + 12, 21)
-        hovered = restart_rect.collidepoint(self.pg.mouse.get_pos())
+        mouse_pos = self.pg.mouse.get_pos()
+        if sound_enabled is not None:
+            mute_hovered = mute_rect.collidepoint(mouse_pos)
+            mute_bg = t.accent_soft if mute_hovered else t.raised
+            mute_border = t.success if sound_enabled else t.line
+            self.pg.draw.rect(self.screen, mute_bg, mute_rect, border_radius=5)
+            self.pg.draw.rect(self.screen, mute_border, mute_rect, 1, border_radius=5)
+            mute_label = "Sound On" if sound_enabled else "Muted"
+            ml_w, ml_h = self.font_label.size(mute_label)
+            self._text(
+                mute_label,
+                self.font_label,
+                t.text if sound_enabled else t.muted,
+                mute_rect.centerx - ml_w // 2,
+                mute_rect.centery - ml_h // 2,
+            )
+
+        hovered = restart_rect.collidepoint(mouse_pos)
         button_color = t.accent_soft if hovered else t.raised
         self.pg.draw.rect(self.screen, button_color, restart_rect, border_radius=5)
         self.pg.draw.rect(self.screen, t.accent, restart_rect, 1, border_radius=5)
@@ -215,11 +371,13 @@ class LiveDashboard:
         )
         self._rule(margin, header_h, c.width - margin * 2)
         self._draw_game(frame, game_x, game_y, game_w, game_h)
+        if run_ended and not finishing and snapshot.clear:
+            self._draw_clear_banner(snapshot, episode_reward, game_x, game_y, game_w, game_h)
 
         x = panel_x + 18
         width = c.panel_width - 42
         y = game_y
-        self._text("World 1–1", self.font_label, t.muted, x, y)
+        self._text(f"World {snapshot.world}–{snapshot.stage}", self.font_label, t.muted, x, y)
         self._text(f"Decision {decision_index:04d}", self.font_small, t.muted, x + width - 100, y)
         y += 27
 
@@ -290,9 +448,12 @@ class LiveDashboard:
             self._text(line, self.font_mono, t.muted, x, y)
             y += 20
 
-        footer = (
-            "Click Restart or press R to play again" if run_ended else "R restarts · Esc or Q quits"
-        )
+        if run_ended:
+            footer = "Click Restart or press R to play again"
+        elif sound_enabled is not None:
+            footer = "M mutes · R restarts · Esc or Q quits"
+        else:
+            footer = "R restarts · Esc or Q quits"
         self._text(footer, self.font_small, t.muted, x, c.height - 28)
         self.pg.display.flip()
         self.clock.tick(c.fps)

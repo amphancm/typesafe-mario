@@ -1,19 +1,23 @@
 # TypeSafe Mario
 
-An experimental controller that lets TypeSafe's Jev model directly choose NES
-controller inputs for the original Super Mario Bros.
+An experimental controller that lets TypeSafe's Jev model—or a local Reinforcement
+Learning (PPO) agent—directly choose NES controller inputs for the original Super
+Mario Bros.
 
-The model does **not** receive screenshots. The harness translates emulator telemetry
-and RAM into compact, object-centric JSON containing Mario's motion, jump trajectory,
+Neither controller receives screenshots. The harness translates emulator telemetry
+and RAM into compact, object-centric state containing Mario's motion, jump trajectory,
 upcoming enemies, terrain, measured response delay, recent-control results, and episode
-progress. Jev chooses one of the legal controller actions, the emulator advances several
-frames, and the loop repeats. The raw local tile grid remains available in debug logs
-and the UI, but is not duplicated in the model input.
+progress. For Jev, this state is sent as structured JSON; for RL, it is encoded into a
+bounded numeric vector. A controller action is chosen, the emulator advances several
+frames, and the loop repeats. The raw local tile grid remains available in debug logs,
+the UI, and the RL observation vector, while being omitted from the Jev JSON payload.
 
 ## Architecture
 
 ```text
 NES emulator -> telemetry/RAM parser -> structured JSON -> Jev Choice -> controller input
+                                     -> 156-dim vector  -> PPO Policy -> controller input
+                                                        -> Hybrid (PPO + Jev escalation)
 ```
 
 The initial action set is intentionally small:
@@ -29,7 +33,7 @@ The initial action set is intentionally small:
 ## Requirements
 
 - Python 3.13 or newer
-- A TypeSafe API key in `TYPESAFE_API_KEY`
+- A TypeSafe API key in `TYPESAFE_API_KEY` (required for `play` and `--hybrid` mode; not required for local RL)
 - A legal local setup for Super Mario Bros.
 
 This repository contains no Nintendo ROM or other copyrighted game data. You are
@@ -42,6 +46,13 @@ lawfully.
 py -3.13 -m venv .venv
 .venv\Scripts\python -m pip install -e ".[mario,dev]"
 $env:TYPESAFE_API_KEY = "your-key"
+```
+
+To include the Reinforcement Learning stack (PyTorch, Stable-Baselines3, TensorBoard),
+install the `rl` extra as well:
+
+```powershell
+.venv\Scripts\python -m pip install -e ".[mario,rl,dev]"
 ```
 
 Inspect the exact JSON and text that will be sent to TypeSafe without launching the
@@ -110,6 +121,94 @@ Exact timing arithmetic stays in code. For example, the parser combines measured
 response age, enemy motion, action cadence, and jump-clearance time into a typed
 `jump_must_start_this_decision` fact. Jev interprets those facts and still owns the
 controller choice—there is no scripted recovery-action override.
+
+## Reinforcement Learning (PPO)
+
+In addition to direct Jev control, `typesafe-mario` includes an offline RAM-based RL
+pipeline built on Gymnasium and Stable-Baselines3 PPO (`256x256` MLP policy).
+
+### Environment & observations
+
+`MarioRLEnv` (single stage) and `MultiStageMarioEnv` (round-robin multi-stage) wrap
+the same `MarioStateParser` telemetry and 7-action macro space used by Jev, adding
+automatic A-button release frames when consecutive jump macros are issued while
+grounded.
+
+Each snapshot is encoded into a 156-dimensional `float32` vector in `[-1.0, 1.0]`:
+
+- **Player & motion (20)**: position, velocity, grounded/airborne flags, jump phase, power-up status, airtime, jump distance, gap-crossing state, stall counter, and clock
+- **Previous action (7)**: one-hot encoding of the last macro action
+- **Terrain & navigation (12)**: obstacle/gap distances, heights/widths, forward clearance, and last grounded preview
+- **Threat summary & enemies (18)**: takeoff urgency, contact horizon, closing speed, and up to 3 upcoming enemies
+- **Local solid tile grid (99)**: flattened `9x11` binary solid-tile neighborhood around Mario
+
+### Reward shaping
+
+`MarioRewardCalculator` shapes step rewards using horizontal progress (with slightly
+stronger backward penalty), new furthest-`x` bonuses, per-step and stall penalties, a
+safe gap-crossing landing bonus, capped score-delta rewards, a death penalty, and a
+stage-clear bonus.
+
+### Behavior Cloning warm-start (`rl-bc`)
+
+You can pretrain a PPO policy from recorded Jev JSONL logs in `artifacts/` before
+running RL fine-tuning:
+
+```powershell
+.venv\Scripts\typesafe-mario rl-bc --inputs artifacts --model-path models/mario_bc.zip --epochs 30
+```
+
+Use `--min-confidence` to filter demonstrations by Jev's choice confidence.
+
+### Training (`rl-train`)
+
+Train a PPO agent in parallel across multiple emulator workers (checkpoints are saved
+under `models/checkpoints/`, the best model as `<model>_best.zip`, and TensorBoard logs
+under `runs/`):
+
+```powershell
+# Single stage (World 1-1)
+.venv\Scripts\typesafe-mario rl-train --env SuperMarioBros-1-1-v0 --timesteps 1500000 --num-envs 8
+
+# Resume / fine-tune from a Behavior Cloning or previous PPO checkpoint
+.venv\Scripts\typesafe-mario rl-train --env SuperMarioBros-1-1-v0 --resume-from models/mario_bc.zip
+
+# Multi-stage training across an entire world (e.g., 1-1 through 1-4) or explicit --envs list
+.venv\Scripts\typesafe-mario rl-train --world 1 --model-path models/mario_world1_ppo.zip
+```
+
+Monitor training curves with TensorBoard:
+
+```powershell
+.venv\Scripts\tensorboard --logdir runs
+```
+
+### Evaluation (`rl-eval`)
+
+Evaluate a trained model over multiple episodes (single stage, `--envs`, or `--world`)
+and optionally export a JSON metrics report:
+
+```powershell
+.venv\Scripts\typesafe-mario rl-eval --model models/mario_ppo_best.zip --env SuperMarioBros-1-1-v0 --episodes 100 --output artifacts/eval_mario_ppo_best.json
+```
+
+### Playing & Hybrid mode (`rl-play`)
+
+Watch a trained PPO policy play live in the telemetry dashboard (supports `--speed`,
+`--display`, `--sound`/`--no-sound`, `--volume`, and `--stochastic`):
+
+```powershell
+.venv\Scripts\typesafe-mario rl-play --model models/mario_ppo_best.zip --env SuperMarioBros-1-1-v0
+```
+
+Enable **Hybrid mode** (`--hybrid`) to run local PPO for routine sub-millisecond
+control and escalate to Jev only when RL confidence drops below `--confidence-threshold`
+(default `0.55`), Mario stalls, or a missed-takeoff hazard is detected (subject to
+cooldown and per-episode API budget):
+
+```powershell
+.venv\Scripts\typesafe-mario rl-play --model models/mario_ppo_best.zip --env SuperMarioBros-1-1-v0 --hybrid --confidence-threshold 0.55
+```
 
 ## Development
 

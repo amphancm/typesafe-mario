@@ -18,11 +18,16 @@ mario = [
   "gymnasium",
   "nes-py>=9.0.1",
   "numpy>=2.1",
-  "pygame>=2.6",
+  "pygame-ce>=2.5.8",
 ]
 dev = [
   "pytest>=8",
   "ruff>=0.9",
+]
+rl = [
+  "stable-baselines3>=2.4.0",
+  "tensorboard>=2.18.0",
+  "torch>=2.5.0",
 ]
 
 [project.scripts]

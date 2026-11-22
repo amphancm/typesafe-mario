@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from .actions import ACTION_TO_INDEX, JUMP_ACTIONS, JUMP_RELEASE_ACTION, Action
+from .audio import AudioConfig, MarioAudioEngine
 from .dashboard import DashboardCommand, LiveDashboard
 from .policy import Decision, Policy
 from .state import MarioStateParser
@@ -71,6 +72,13 @@ def _record_decision(
     log.flush()
 
 
+def _extract_area_type(env: Any) -> int | None:
+    ram = _unwrap_ram(env)
+    if ram is None or len(ram) <= 0x074E:
+        return None
+    return int(ram[0x074E])
+
+
 def _run_realtime_dashboard(
     *,
     env: Any,
@@ -83,6 +91,7 @@ def _run_realtime_dashboard(
     frames_per_decision: int,
     max_decisions: int,
     screenshot_path: Path | None,
+    audio: MarioAudioEngine | None = None,
 ) -> None:
     actions = tuple(Action)
     active_decision: Decision | None = None
@@ -170,6 +179,9 @@ def _run_realtime_dashboard(
                 episode_reward += float(reward)
                 frame_index += 1
 
+            if audio is not None:
+                audio.update(snapshot, area_type=_extract_area_type(env))
+
             command = dashboard.draw(
                 frame,
                 snapshot,
@@ -178,17 +190,22 @@ def _run_realtime_dashboard(
                 episode_reward=episode_reward,
                 waiting=pending is not None,
                 run_ended=run_ended,
+                sound_enabled=(not audio.muted) if audio is not None else None,
             )
             if screenshot_path is not None and active_decision is not None and not screenshot_saved:
                 dashboard.save(screenshot_path)
                 screenshot_saved = True
             if command == DashboardCommand.QUIT:
                 break
+            if command == DashboardCommand.TOGGLE_MUTE and audio is not None:
+                audio.toggle_mute()
             if command == DashboardCommand.RESTART:
                 if pending is not None:
                     pending.cancel()
                 frame, info = env.reset()
                 parser.reset()
+                if audio is not None:
+                    audio.reset()
                 active_decision = None
                 pending = None
                 pending_snapshot = None
@@ -217,15 +234,24 @@ def run_episode(
     artifacts_dir: Path,
     display: str = "dashboard",
     screenshot_path: Path | None = None,
+    sound: bool = True,
+    volume: float = 0.5,
 ) -> Path:
     if frames_per_decision < 1:
         raise ValueError("frames_per_decision must be at least 1")
 
     if display not in {"dashboard", "game", "none"}:
         raise ValueError("display must be dashboard, game, or none")
+    if not 0.0 <= volume <= 1.0:
+        raise ValueError("volume must be between 0.0 and 1.0")
     render_mode = "human" if display == "game" else "rgb_array"
     env = create_mario_env(env_id, render_mode=render_mode)
     dashboard = LiveDashboard() if display == "dashboard" else None
+    audio = (
+        MarioAudioEngine(AudioConfig(enabled=True, volume=volume))
+        if sound and display != "none"
+        else None
+    )
     parser = MarioStateParser(decision_horizon_frames=frames_per_decision)
     artifacts_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
@@ -247,6 +273,7 @@ def run_episode(
                     frames_per_decision=frames_per_decision,
                     max_decisions=max_decisions,
                     screenshot_path=screenshot_path,
+                    audio=audio,
                 )
                 return log_path
 
@@ -263,6 +290,8 @@ def run_episode(
                     previous_latency_ms=previous_latency_ms,
                     previous_response_delay_frames=0,
                 )
+                if audio is not None:
+                    audio.update(snapshot, area_type=_extract_area_type(env))
                 if snapshot.dead or snapshot.clear:
                     break
 
@@ -297,6 +326,8 @@ def run_episode(
                 if terminated or truncated:
                     break
     finally:
+        if audio is not None:
+            audio.close()
         if dashboard:
             dashboard.close()
         env.close()
