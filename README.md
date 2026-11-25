@@ -14,6 +14,8 @@ the UI, and the RL observation vector, while being omitted from the Jev JSON pay
 
 ## Architecture
 
+![NES AI Agent Control Architecture](picture/TypeSafeMarioHybrid_AI_Diagram.jpeg)
+
 ```text
 NES emulator -> telemetry/RAM parser -> structured JSON -> Jev Choice -> controller input
                                      -> 156-dim vector  -> PPO Policy -> controller input
